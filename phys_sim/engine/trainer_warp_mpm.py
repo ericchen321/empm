@@ -107,6 +107,7 @@ class InvPhyTrainerWarpMPM:
             self.object_visibilities = self.dataset.object_visibilities
             self.object_motions_valid = self.dataset.object_motions_valid
             self.controller_points = self.dataset.controller_points
+            self.controller_labels = self.dataset.controller_labels
             self.structure_points = self.dataset.structure_points
             self.num_original_points = self.dataset.num_original_points
             self.num_surface_points = self.dataset.num_surface_points
@@ -152,13 +153,20 @@ class InvPhyTrainerWarpMPM:
         self.obj_points = transform_points(self.object_points.clone(),
                                            name=self.exp_name)
         # [TODO]: handlers
-        self.n_ctrl_parts = 2 if "double" in cfg.case_name else 1 if "single" in cfg.case_name else 0
+        if self.controller_labels is not None:
+            labels, ctrl_mask = torch.unique(
+                self.controller_labels, sorted=True, return_inverse=True
+            )
+            self.n_ctrl_parts = len(labels)
+        else:
+            self.n_ctrl_parts = 2 if "double" in cfg.case_name else 1 if "single" in cfg.case_name else 0
+            if self.n_ctrl_parts > 0:
+                ctrl_y = self.ctrl_points[0, :, 1]
+                y_mid = (torch.min(ctrl_y) + torch.max(ctrl_y)) / 2
+                ctrl_mask = (ctrl_y < y_mid)
         ctrl_index = []
         handler_pos = []  # handler center position
         if self.n_ctrl_parts > 0:
-            ctrl_y = self.ctrl_points[0, :, 1]
-            y_mid = (torch.min(ctrl_y) + torch.max(ctrl_y)) / 2
-            ctrl_mask = (self.ctrl_points[0, :, 1] < y_mid)
             ctrl_pts = self.ctrl_points[0].clone()
             obj_pts = self.obj_points[0]
             dists = torch.cdist(ctrl_pts, obj_pts, p=2)
@@ -686,7 +694,8 @@ class InvPhyTrainerWarpMPM:
             structure_points(6405) = object_points(4895=num_original_points) + other_surface_points(+538=num_surface_points) + interior_points(+972=num_all_points)
         """
         n_train_frames = cfg.train_frame
-        n_train_frames = min(n_train_frames, 35)
+        if self.controller_labels is None:
+            n_train_frames = min(n_train_frames, 35)
         n_track_points = self.num_original_points
         print("--train_frames", n_train_frames)
         print("--num_tracked_points", n_track_points)

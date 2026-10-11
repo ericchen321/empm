@@ -76,6 +76,10 @@ class RealData:
         self.controller_points = torch.tensor(
             controller_points, dtype=torch.float32, device=cfg.device
         )
+        self.controller_labels = (
+            torch.tensor(data["controller_labels"], dtype=torch.long, device=cfg.device)
+            if "controller_labels" in data else None
+        )
 
         if DATASET == "pet": # offset for pet
             offset = torch.tensor([0, -0.015, 0], dtype=torch.float32, device=cfg.device)

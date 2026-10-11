@@ -9,7 +9,7 @@ dist/
 
 # Data and outputs
 data_custom/
-outputs/
+outputs
 outcmaes/
 wandb/
 experiments*/
@@ -39,4 +39,9 @@ data_pipeline/data_process/groundedSAM_checkpoints/
 scripts/test.py
 .env
 .venv
+.conda/
 archived/
+
+# Agent working notes; keep repository skills versioned.
+/.agents/*/
+!/.agents/skills/

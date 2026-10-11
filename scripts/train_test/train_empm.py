@@ -51,15 +51,26 @@ if __name__ == "__main__":
         default="configs/experiments.yaml",
         help="Path to the experiments YAML file (default: %(default)s).",
     )
+    parser.add_argument(
+        "--case-dir",
+        help="Train one prepared case in place (for example, outputs/<run_tag>).",
+    )
     args = parser.parse_args()
 
     seed = 42
     set_all_seeds(seed)
-    config = load_config(args.exp_config)
-    base_path = config["base_path"]
-    output_path = config["output_path"]
+    if args.case_dir:
+        case_dir = os.path.abspath(args.case_dir)
+        base_path = os.path.dirname(case_dir)
+        output_path = base_path
+        experiments = [{"case_name": os.path.basename(case_dir)}]
+    else:
+        config = load_config(args.exp_config)
+        base_path = config["base_path"]
+        output_path = config["output_path"]
+        experiments = config["experiments"]
 
-    for exp in config["experiments"]:
+    for exp in experiments:
         case_name = exp["case_name"]
         print(f"--case_name: {case_name}")
 

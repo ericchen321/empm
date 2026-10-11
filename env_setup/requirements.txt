@@ -7,7 +7,7 @@ trimesh==4.7.4
 rtree==1.4.1
 pyrender==0.1.45
 pyvista==0.49.0
-pynput-1.8.2
+pynput==1.8.2
 stannum==0.9.1
 termcolor==3.1.0
 fvcore==0.1.5.post20221221
