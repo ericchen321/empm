@@ -1,8 +1,0 @@
----
-name: run-code-and-debug
-description: This skill should be triggered when the agent is given explicit instruction to run a script, inspect outputs, validate results (and potentially debug).
----
-
-For running scripts under `scripts/`, activate conda environment `.conda/hag4r-mpc`. For running a specific module, use `python -m src.module_name` with appropriate CLI arguments. Refer to `readme.md` for CLI arguments to pass to the script; but note that if what's instructed in `readme.md` is inconsistent with the script's content, update `readme.md` according to the script. Ask me if you're unsure about path to files (needed as CLI arguments).
-
-If the agent is not given explicit instruction to debug, just conduct a "pilot run" and notify user of the results printed to terminal and artifacts generated; bring up anything that looks like a bug/error. If the agent is explicitly instructed to debug, delegate inspection of run logs and summarization of key info, error to subagents; the main agent quries subagents what they see, reflect on the anomalies observed, hypothesizes what went wrong, and determines what need to be changed and proceed to make changes, and rerun the code. Then the main agent delegate insepction to the subagents and assesses if the issue is resolved; if not, further reflects, hypothesizes and executes new modifications. This loop continues until the issue is resolved, but should break when, after three trials of debugging the expected and final results still have significant differences, indicating that the issue might be too hard for the agent to solve on its own and human intervention is needed. In that case, the agent should clearly summarize the issue, what has been tried, and why it thinks human intervention is needed.

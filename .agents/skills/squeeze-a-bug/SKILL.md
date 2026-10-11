@@ -13,7 +13,7 @@ Systematically debug a hard-to-reproduce or hard-to-diagnose bug by iterating th
 
 | Actor | Model | Role | Active when |
 |---|---|---|---|
-| **Hypothesizer** | GPT 5.6 Sol xhigh or Claude Opus 4.7 with highest level of reasoning possible, whichever is available | Proposes root-cause hypothesis; defines confirmation checklist; defines a single feature to test it; evaluates runtime evidence; refines or replaces hypothesis based on evidence | Hypothesis rounds and evidence-evaluation rounds |
+| **Hypothesizer** | GPT 6 Astra xhigh or Claude Opus 5.5 with highest level of reasoning possible, whichever is available | Proposes root-cause hypothesis; defines confirmation checklist; defines a single feature to test it; evaluates runtime evidence; refines or replaces hypothesis based on evidence | Hypothesis rounds and evidence-evaluation rounds |
 | **Feature team** | (via `build-a-feature` skill) | Implements the feature specified by the Hypothesizer for the current hypothesis | One feature per hypothesis round |
 | **Main agent** | — | Orchestrates actors, passes context, drives the loop, writes the report | Throughout |
 

@@ -7,10 +7,10 @@ description: Explore the codebase, produce a concrete implementation plan, imple
 
 Build a feature (or patch, fix) in four explicit phases, using one distinct sub-agent for each phase:
 
-1. **Explore** (5.6 Luna model, max reasoning)
-2. **Plan** (5.6 Sol model, xhigh reasoning)
-3. **Implement** (6 Astra model, high reasoning)
-4. **Validate** (6 Astra model, xhigh reasoning)
+1. **Explore** (6 Luna model, max reasoning)
+2. **Plan** (6 Sol model, xhigh reasoning)
+3. **Implement** (6 Sol model, high reasoning)
+4. **Validate** (6 Sol model, xhigh reasoning)
 
 Do not skip phases unless with user's explicit instruction. Do not jump into implementation before exploration and planning are complete.
 
@@ -57,7 +57,7 @@ Produce a concise exploration summary that includes:
 - open questions or assumptions
 
 Do **not** implement during this phase unless a tiny exploratory patch is absolutely necessary to understand behavior. If that happens, explicitly say so and ask for user's permission before editing.
-
+5 w
 ---
 
 ## Phase 2: Plan
@@ -142,7 +142,7 @@ Then the main agent spawns a validator agent which compiles, inspects compilatio
 - End with a grounded summary of validation status
 
 ### Validation instructions
-Use conda environment `.conda/hag4r-mpc` for running scripts. 
+Use conda environment `.conda/empm` for running scripts. 
 
 If the validator agent is not given explicit instruction to debug (or "tune until success"), just conduct a "pilot run" and notify user of the results printed to terminal and artifacts generated; bring up anything that looks like a bug/error. If the agent is explicitly instructed to debug (or "tune until success"), run script, inspect outputs (terminal output and generated artifacts), reason about the expected outputs, the current/actual outputs and the difference; then determine what need to be changed, request the implementor agent to make the necessary changes, and rerun the code. Carry out this run->assess results->fix->run... loop until any identifable issues have been resolved. The loop should break when, after over 5 trials of debugging the expected and final results still have significant differences, indicating that the issue might be too hard for the agent to solve on its own and human intervention is needed. In that case, the agent should clearly summarize the issue, what has been tried, and why it thinks human intervention is needed.
 
