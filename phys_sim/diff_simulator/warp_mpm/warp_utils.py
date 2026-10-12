@@ -91,6 +91,24 @@ def from_torch_safe(t, dtype=None, requires_grad=None, grad=None):
 
 
 class MyTape(wp.Tape):
+    def record_launch(self, kernel, dim, max_blocks, inputs, outputs, device, block_dim=0, metadata=None):
+        # Warp keeps Python struct references on its tape. Controllers update
+        # their point/velocity between steps, so retain the values used by each
+        # launch while sharing the underlying differentiable arrays.
+        def snapshot(value):
+            if not isinstance(value, wp.codegen.StructInstance):
+                return value
+            result = value._cls()
+            for name, _ in value._cls.ctype._fields_:
+                if not name.startswith("_"):
+                    setattr(result, name, snapshot(getattr(value, name)))
+            return result
+
+        super().record_launch(kernel, dim, max_blocks,
+                              [snapshot(value) for value in inputs],
+                              [snapshot(value) for value in outputs],
+                              device, block_dim, metadata)
+
     # returns the adjoint of a kernel parameter
     def get_adjoint(self, a):
         if not wp.types.is_array(a) and not isinstance(a, wp.codegen.StructInstance):

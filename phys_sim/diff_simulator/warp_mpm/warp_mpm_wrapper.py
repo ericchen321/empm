@@ -279,7 +279,7 @@ class WarpMPMWrapper:
         """
             Return postions as a torch tensor (F, N, 3)
         """
-        n_substeps = int(self.frame_dt / self.sim_dt)
+        n_substeps = round(self.frame_dt / self.sim_dt)
         prev_state = self.mpm_state
         vertices = [wp.to_torch(prev_state.particle_x)]
         step_count = 0
@@ -346,7 +346,7 @@ class WarpMPMWrapper:
         E_t.requires_grad_()
 
         losses = []
-        n_substeps = int(self.frame_dt / self.sim_dt)
+        n_substeps = round(self.frame_dt / self.sim_dt)
         n_step_with_grad = n_train_frames * n_substeps
         extra_no_grad_step = 0
 
@@ -441,7 +441,7 @@ class WarpMPMWrapper:
                                                                patience=5)
 
         losses = []
-        n_substeps = int(self.frame_dt / self.sim_dt)
+        n_substeps = round(self.frame_dt / self.sim_dt)
         n_step_with_grad = n_train_frames * n_substeps
         extra_no_grad_step = 0
         with tqdm(range(max_iters), desc=f"") as pbar:

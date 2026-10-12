@@ -101,7 +101,7 @@ class MPMStateStruct(object):
             (grid_res, grid_res, grid_res),
             dtype=float,
             device=device,
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
         self.grid_v_in = wp.zeros(
             (grid_res, grid_res, grid_res),
@@ -365,10 +365,13 @@ class MPMStateStruct(object):
 
         # new_state.particle_selection = wp.clone(self.particle_selection, requires_grad=False)
 
-        wp.copy(new_state.particle_vol, self.particle_vol)
-        wp.copy(new_state.particle_density, self.particle_density)
-        wp.copy(new_state.particle_mass, self.particle_mass)
-        wp.copy(new_state.particle_selection, self.particle_selection)
+        # These quantities are constant over a rollout. Sharing their arrays
+        # preserves every step's contribution to density/mass derivatives;
+        # wp.copy is not recorded as a differentiable operation by Warp.
+        new_state.particle_vol = self.particle_vol
+        new_state.particle_density = self.particle_density
+        new_state.particle_mass = self.particle_mass
+        new_state.particle_selection = self.particle_selection
 
         # init grid to zero with grid res.
         new_state.init_grid(

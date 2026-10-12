@@ -19,6 +19,7 @@ class MPMWARPDiff(object):
         self.n_particles = n_particles
 
         self.time = 0.0
+        self.step_callback = None
 
         self.grid_postprocess = []
         self.collider_params = []
@@ -262,6 +263,11 @@ class MPMWARPDiff(object):
             "apply_BC_on_grid", synchronize=True, print=False, dict=self.time_profile
         ):
             for k in range(len(self.grid_postprocess)):
+                # A contact velocity replaces the incoming velocity. Keeping
+                # separate arrays prevents its cotangent leaking through the
+                # overwritten grid value during Warp's reverse pass.
+                grid_v_out = (wp.empty_like(mpm_state.grid_v_out, requires_grad=True)
+                              if mpm_state.grid_v_out.requires_grad else mpm_state.grid_v_out)
                 wp.launch(
                     kernel=self.grid_postprocess[k],
                     dim=grid_size,
@@ -271,9 +277,11 @@ class MPMWARPDiff(object):
                         mpm_state,
                         mpm_model,
                         self.collider_params[k],
+                        grid_v_out,
                     ],
                     device=device,
                 )
+                mpm_state.grid_v_out = grid_v_out
                 if self.modify_bc[k] is not None:
                     self.modify_bc[k](self.time, dt, self.collider_params[k])
 
@@ -382,6 +390,7 @@ class MPMWARPDiff(object):
             "apply_BC_on_grid", synchronize=True, print=False, dict=self.time_profile
         ):
             for k in range(len(self.grid_postprocess)):
+                grid_v_out = mpm_state.grid_v_out
                 wp.launch(
                     kernel=self.grid_postprocess[k],
                     dim=grid_size,
@@ -391,6 +400,7 @@ class MPMWARPDiff(object):
                         mpm_state,
                         mpm_model,
                         self.collider_params[k],
+                        grid_v_out,
                     ],
                     device=device,
                 )
@@ -477,8 +487,10 @@ class MPMWARPDiff(object):
             state: MPMStateStruct,
             model: MPMModelStruct,
             param: Dirichlet_collider,
+            grid_v_out: wp.array(dtype=wp.vec3, ndim=3),
         ):
             grid_x, grid_y, grid_z = wp.tid()
+            v_out = state.grid_v_out[grid_x, grid_y, grid_z]
             if time >= param.start_time and time < param.end_time:
                 offset = wp.vec3(
                     float(grid_x) * model.dx - param.point[0],
@@ -490,7 +502,7 @@ class MPMWARPDiff(object):
 
                 if dotproduct < 0.0:
                     if param.surface_type == 0:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                        v_out = wp.vec3(
                             0.0, 0.0, 0.0
                         )
                     elif param.surface_type == 11:
@@ -498,16 +510,16 @@ class MPMWARPDiff(object):
                             float(grid_z) * model.dx < 0.4
                             or float(grid_z) * model.dx > 0.53
                         ):
-                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                            v_out = wp.vec3(
                                 0.0, 0.0, 0.0
                             )
                         else:
-                            v_in = state.grid_v_out[grid_x, grid_y, grid_z]
-                            state.grid_v_out[grid_x, grid_y, grid_z] = (
+                            v_in = v_out
+                            v_out = (
                                 wp.vec3(v_in[0], 0.0, v_in[2]) * 0.3
                             )
                     else:
-                        v = state.grid_v_out[grid_x, grid_y, grid_z]
+                        v = v_out
                         normal_component = wp.dot(v, n)
                         if param.surface_type == 1:
                             v = (
@@ -523,9 +535,10 @@ class MPMWARPDiff(object):
                             ) * wp.normalize(
                                 v
                             )  # apply friction here
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                        v_out = wp.vec3(
                             0.0, 0.0, 0.0
                         )
+            grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)
@@ -616,10 +629,12 @@ class MPMWARPDiff(object):
             state: MPMStateStruct,
             model: MPMModelStruct,
             param: Dirichlet_collider,
+            grid_v_out: wp.array(dtype=wp.vec3, ndim=3),
         ):
             # [TODO]: support moving geometry by updating param.point based on time
             # [TODO]: support different boundary types
             grid_x, grid_y, grid_z = wp.tid()
+            v_out = state.grid_v_out[grid_x, grid_y, grid_z]
             if time >= param.start_time and time < param.end_time and param.active:
                 pos = wp.vec3(float(grid_x) * model.dx, float(grid_y) * model.dx, float(grid_z) * model.dx)
                 if geo_type == 1: # cube
@@ -629,39 +644,39 @@ class MPMWARPDiff(object):
                         wp.abs(offset[1]) < param.size[1] and
                         wp.abs(offset[2]) < param.size[2]
                     ):
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                        v_out = wp.vec3(0.0, 0.0, 0.0)
                 elif geo_type == 2: # sphere
                     offset = pos - param.point
                     if wp.length(offset) < param.radius:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                        v_out = wp.vec3(0.0, 0.0, 0.0)
                 elif geo_type == 3: # cylinder
                     offset = pos - param.point
                     axis = param.normal
                     proj = wp.dot(offset, axis)
                     radial = offset - proj * axis
                     if wp.abs(proj) < param.half_height and wp.length(radial) < param.radius:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                        v_out = wp.vec3(0.0, 0.0, 0.0)
                 elif geo_type == 4: # halfspace
                     offset = pos - param.point
                     n = param.normal
                     dotproduct = wp.dot(offset, n)
                     if dotproduct < 0.0:
                         if param.surface_type == 0:
-                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                            v_out = wp.vec3(0.0, 0.0, 0.0)
                         elif param.surface_type == 11:
                             # Example: restrict z range for 'cut' type
                             if (
                                 float(grid_z) * model.dx < 0.4
                                 or float(grid_z) * model.dx > 0.53
                             ):
-                                state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                                v_out = wp.vec3(0.0, 0.0, 0.0)
                             else:
-                                v_in = state.grid_v_out[grid_x, grid_y, grid_z]
-                                state.grid_v_out[grid_x, grid_y, grid_z] = (
+                                v_in = v_out
+                                v_out = (
                                     wp.vec3(v_in[0], 0.0, v_in[2]) * 0.3
                                 )
                         else:
-                            v = state.grid_v_out[grid_x, grid_y, grid_z]
+                            v = v_out
                             normal_component = wp.dot(v, n)
                             if param.surface_type == 1:
                                 v = v - normal_component * n
@@ -669,7 +684,8 @@ class MPMWARPDiff(object):
                                 v = v - wp.min(normal_component, 0.0) * n
                             if normal_component < 0.0 and wp.length(v) > 1e-20:
                                 v = wp.max(0.0, wp.length(v) + normal_component * param.friction) * wp.normalize(v)
-                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                            v_out = wp.vec3(0.0, 0.0, 0.0)
+            grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         # def modify(time, dt, param: Dirichlet_collider):
         #     if time >= param.start_time and time < param.end_time:
@@ -760,8 +776,10 @@ class MPMWARPDiff(object):
             state: MPMStateStruct,
             model: MPMModelStruct,
             param: Dirichlet_collider,
+            grid_v_out: wp.array(dtype=wp.vec3, ndim=3),
         ):
             grid_x, grid_y, grid_z = wp.tid()
+            v_out = state.grid_v_out[grid_x, grid_y, grid_z]
             if time >= param.start_time and time < param.end_time and param.active:
                 pos = wp.vec3(float(grid_x) * model.dx, float(grid_y) * model.dx, float(grid_z) * model.dx)
                 offset = pos - param.point
@@ -773,24 +791,25 @@ class MPMWARPDiff(object):
                         wp.abs(offset[1]) < param.size[1] and
                         wp.abs(offset[2]) < param.size[2]
                     ):
-                        state.grid_v_out[grid_x, grid_y, grid_z] = v
+                        v_out = v
                 elif geo_type == 2: # sphere
                     if wp.length(offset) < param.radius:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = v
+                        v_out = v
                 elif geo_type == 3: # cylinder
                     axis = param.normal
                     proj = wp.dot(offset, axis)
                     radial = offset - proj * axis
                     if wp.abs(proj) < param.half_height and wp.length(radial) < param.radius:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = v
+                        v_out = v
                 elif geo_type == 4: # halfspace/plane
                     n = param.normal
                     dotproduct = wp.dot(offset, n)
                     if dotproduct < 0.0:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = v
+                        v_out = v
             elif param.reset == 1:
                 if time < param.end_time + 15.0 * dt:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                    v_out = wp.vec3(0.0, 0.0, 0.0)
+            grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         def modify(time, dt, param: Dirichlet_collider):
             if time >= param.start_time and time < param.end_time:
@@ -839,8 +858,10 @@ class MPMWARPDiff(object):
             state: MPMStateStruct,
             model: MPMModelStruct,
             param: Dirichlet_collider,
+            grid_v_out: wp.array(dtype=wp.vec3, ndim=3),
         ):
             grid_x, grid_y, grid_z = wp.tid()
+            v_out = state.grid_v_out[grid_x, grid_y, grid_z]
             if time >= param.start_time and time < param.end_time:
                 offset = wp.vec3(
                     float(grid_x) * model.dx - param.point[0],
@@ -852,10 +873,11 @@ class MPMWARPDiff(object):
                     and wp.abs(offset[1]) < param.size[1]
                     and wp.abs(offset[2]) < param.size[2]
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = param.velocity
+                    v_out = param.velocity
             elif param.reset == 1:
                 if time < param.end_time + 15.0 * dt:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                    v_out = wp.vec3(0.0, 0.0, 0.0)
+            grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         def modify(time, dt, param: Dirichlet_collider):
             if time >= param.start_time and time < param.end_time:
@@ -882,57 +904,60 @@ class MPMWARPDiff(object):
             state: MPMStateStruct,
             model: MPMModelStruct,
             param: Dirichlet_collider,
+            grid_v_out: wp.array(dtype=wp.vec3, ndim=3),
         ):
             grid_x, grid_y, grid_z = wp.tid()
+            v_out = state.grid_v_out[grid_x, grid_y, grid_z]
             padding = 3
             if time >= param.start_time and time < param.end_time:
-                if grid_x < padding and state.grid_v_out[grid_x, grid_y, grid_z][0] < 0:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                if grid_x < padding and v_out[0] < 0:
+                    v_out = wp.vec3(
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        v_out[1],
+                        v_out[2],
                     )
                 if (
                     grid_x >= model.grid_dim_x - padding
-                    and state.grid_v_out[grid_x, grid_y, grid_z][0] > 0
+                    and v_out[0] > 0
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                    v_out = wp.vec3(
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        v_out[1],
+                        v_out[2],
                     )
 
-                if grid_y < padding and state.grid_v_out[grid_x, grid_y, grid_z][1] < 0:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
+                if grid_y < padding and v_out[1] < 0:
+                    v_out = wp.vec3(
+                        v_out[0],
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        v_out[2],
                     )
                 if (
                     grid_y >= model.grid_dim_y - padding
-                    and state.grid_v_out[grid_x, grid_y, grid_z][1] > 0
+                    and v_out[1] > 0
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
+                    v_out = wp.vec3(
+                        v_out[0],
                         0.0,
-                        state.grid_v_out[grid_x, grid_y, grid_z][2],
+                        v_out[2],
                     )
 
-                if grid_z < padding and state.grid_v_out[grid_x, grid_y, grid_z][2] < 0:
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
+                if grid_z < padding and v_out[2] < 0:
+                    v_out = wp.vec3(
+                        v_out[0],
+                        v_out[1],
                         0.0,
                     )
                 if (
                     grid_z >= model.grid_dim_z - padding
-                    and state.grid_v_out[grid_x, grid_y, grid_z][2] > 0
+                    and v_out[2] > 0
                 ):
-                    state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                        state.grid_v_out[grid_x, grid_y, grid_z][0],
-                        state.grid_v_out[grid_x, grid_y, grid_z][1],
+                    v_out = wp.vec3(
+                        v_out[0],
+                        v_out[1],
                         0.0,
                     )
+            grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)
@@ -1279,11 +1304,14 @@ class MPMWARPDiff(object):
             state: MPMStateStruct,
             model: MPMModelStruct,
             grid_modifier_params: GridCollider,
+            grid_v_out: wp.array(dtype=wp.vec3, ndim=3),
         ):
             grid_x, grid_y, grid_z = wp.tid()
+            v_out = state.grid_v_out[grid_x, grid_y, grid_z]
 
             if grid_modifier_params.mask[grid_x, grid_y, grid_z] >= 1:
-                state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+                v_out = wp.vec3(0.0, 0.0, 0.0)
+            grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         self.grid_postprocess.append(modify_grid_v_before_g2p)
         self.modify_bc.append(None)

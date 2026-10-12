@@ -68,7 +68,12 @@ class InvPhyTrainerWarpMPM:
         pure_inference_mode=False,
         device="cuda:0",
         online=False,
+        save_artifacts=True,
+        mpm_kwargs=None,
+        mpm_shift=None,
     ):
+        self.mpm_kwargs = mpm_kwargs or {}
+        self.mpm_shift = np.asarray(mpm_shift if mpm_shift is not None else (0., 0., 0.))
         if not online:
             self.init_offline(
                 data_path,
@@ -78,6 +83,7 @@ class InvPhyTrainerWarpMPM:
                 velocity_path,
                 pure_inference_mode,
                 device,
+                save_artifacts,
             )
         else:
             self.init_online(data_path, base_dir, device)
@@ -89,7 +95,8 @@ class InvPhyTrainerWarpMPM:
                      mask_path=None,
                      velocity_path=None,
                      pure_inference_mode=False,
-                     device="cuda:0"):
+                     device="cuda:0",
+                     save_artifacts=True):
         cfg.data_path = data_path
         cfg.base_dir = base_dir
         cfg.device = device
@@ -100,7 +107,7 @@ class InvPhyTrainerWarpMPM:
         self.init_velocities = None
         # Load the data
         if cfg.data_type == "real":
-            self.dataset = RealData(visualize=False, save_gt=True)
+            self.dataset = RealData(visualize=False, save_gt=save_artifacts)
             # Get the object points and controller points
             self.object_points = self.dataset.object_points
             self.object_colors = self.dataset.object_colors
@@ -194,8 +201,9 @@ class InvPhyTrainerWarpMPM:
                       ],  # controller size (default: 0.015)
             "ctrl_mask": ctrl_mask
         }
-        save_ply_seq(self.ctrl_points[:], f"{self.vis_path}/sim", "ctrl_")
-        save_ply_seq(self.obj_points, f"{self.vis_path}/sim", "obj_")
+        if save_artifacts:
+            save_ply_seq(self.ctrl_points[:], f"{self.vis_path}/sim", "ctrl_")
+            save_ply_seq(self.obj_points, f"{self.vis_path}/sim", "obj_")
 
     def _init_start(
         self,
@@ -355,10 +363,11 @@ class InvPhyTrainerWarpMPM:
         init_x = self.object_points[0].clone()
         # init_x = self.structure_points.clone()
         init_x = transform_points(x=init_x, name=self.exp_name)
-        if init_x[:, 2].min() < 0.5 + 1e-4:
+        init_x -= torch.as_tensor(self.mpm_shift, dtype=init_x.dtype, device=init_x.device)
+        if init_x[:, 2].min() < 0.5 - self.mpm_shift[2] + 1e-4:
             init_x[:, 2] += 0.001  # lift up a bit to avoid initial penetration
 
-        mpm = WarpMPMWrapper(requires_grad=diff_sim)
+        mpm = WarpMPMWrapper(requires_grad=diff_sim, **self.mpm_kwargs)
 
         # material
         mpm.material_params = material_gallery[parameters["type"]]
@@ -370,7 +379,7 @@ class InvPhyTrainerWarpMPM:
 
         # boundary conditions
         # ground
-        mpm.surface_colliders.append([(0., 0., 0.5), (0., 0., 1.), "sticky",
+        mpm.surface_colliders.append([(0., 0., 0.5 - self.mpm_shift[2]), (0., 0., 1.), "sticky",
                                       0.])
         # controllers
         ctrl_config_file = f"{cfg.base_dir}/ctrl_param.pkl"
@@ -379,7 +388,7 @@ class InvPhyTrainerWarpMPM:
                 self.ctrl_param = pickle.load(f)
         for i in range(self.n_ctrl_parts):
             csize = self.ctrl_param["csize"][i]
-            point = self.ctrl_param["handler_pos"][i]
+            point = np.asarray(self.ctrl_param["handler_pos"][i]) - self.mpm_shift
             # print("Fixed point:", point)
             mpm.moving_boundaries.append([point, csize, (0., 0., 0.), 0.0])
 
@@ -444,7 +453,7 @@ class InvPhyTrainerWarpMPM:
             init_x[self.obj_mask[0], 1] += 0.0015
             init_x[self.obj_mask[1], 1] -= 0.0015
 
-        mpm = WarpMPMWrapper(requires_grad=diff_sim)
+        mpm = WarpMPMWrapper(requires_grad=diff_sim, **self.mpm_kwargs)
 
         # material
         mpm.material_params = material_gallery[parameters["type"]]
@@ -729,8 +738,12 @@ class InvPhyTrainerWarpMPM:
         # ------ define loss func -----
         # object_visibilities = self.object_visibilities[:n_train_frames]
         # object_motions_valid = self.object_motions_valid[:n_train_frames]
-        target_points = transform_points(x=self.object_points[:n_train_frames],
+        # Trail returns the end of each simulated frame; frame zero is the
+        # observed initial state and has no prediction to fit.
+        target_points = transform_points(x=self.object_points[1:n_train_frames],
                                          name=self.exp_name)
+        target_points -= torch.as_tensor(self.mpm_shift, dtype=target_points.dtype,
+                                         device=target_points.device)
         save_ply_file(target_points[-1], f"{self.vis_path}/optim/gt_final.ply")
 
         def loss_func(points):
@@ -752,9 +765,9 @@ class InvPhyTrainerWarpMPM:
             # loss = loss_chamfer + loss_tracking
 
             total_loss_chamfer = 0.0
-            for t in range(n_train_frames):
+            for t in range(n_train_frames - 1):
                 # Chamfer loss for visible points
-                vis_mask = self.object_visibilities[t]
+                vis_mask = self.object_visibilities[t + 1]
                 pts_pred_vis = points[t][vis_mask].unsqueeze(0)
                 pts_target_vis = target_points[t][vis_mask].unsqueeze(0)
                 loss_chamfer, _ = chamfer_distance(pts_pred_vis,
@@ -762,8 +775,9 @@ class InvPhyTrainerWarpMPM:
                 total_loss_chamfer += loss_chamfer
 
             total_loss_tracking = 0.0
-            for t in range(n_train_frames):
-                # Tracking loss for valid motion points
+            for t in range(n_train_frames - 1):
+                # This mask validates the transition t -> t+1, whose endpoint
+                # is the observed frame matched by points[t].
                 valid_mask = self.object_motions_valid[t]
                 pts_pred_valid = points[t][valid_mask]
                 pts_target_valid = target_points[t][valid_mask]
@@ -778,7 +792,7 @@ class InvPhyTrainerWarpMPM:
         logger.info(f"Initial parameters: {params}")
         optimal_param = mpm.run_diff_optimization(
             parameters=params,
-            n_train_frames=n_train_frames,
+            n_train_frames=n_train_frames - 1,
             max_iters=max_iter,
             loss_func=loss_func)
         logger.info(f"Optimal parameters: {optimal_param}")

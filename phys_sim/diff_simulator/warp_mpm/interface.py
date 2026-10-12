@@ -66,17 +66,20 @@ class MPMDifferentiableSimulationTrail(autograd.Function):
             init_xyzs_wp = from_torch_safe(init_pos.clone().detach().contiguous(), dtype=wp.vec3, requires_grad=requires_grad)
             mpm_solver.restart_and_compute_F_C(mpm_model, mpm_state, init_xyzs_wp, device=device)
         
-        if E.ndim == 0:
-            E_inp = E.item() * 1e6 # [TODO] float
+        ctx.E_shape = E.shape
+        ctx.E_scale = 1e6 if E.ndim == 0 else 1.0
+        if E.numel() == 1:
+            E_inp = E.item() * ctx.E_scale
             ctx.aggregating_E = True
         else:
-            E_inp = from_torch_safe(E, dtype=wp.float32, requires_grad=requires_grad)
+            E_inp = from_torch_safe(E.detach().contiguous(), dtype=wp.float32, requires_grad=False)
             ctx.aggregating_E = False
-        if nu.ndim == 0:
+        ctx.nu_shape = nu.shape
+        if nu.numel() == 1:
             nu_inp = nu.item() # float
             ctx.aggregating_nu = True
         else:
-            nu_inp = from_torch_safe(nu, dtype=wp.float32, requires_grad=requires_grad)
+            nu_inp = from_torch_safe(nu.detach().contiguous(), dtype=wp.float32, requires_grad=False)
             ctx.aggregating_nu = False
             
         mpm_solver.set_E_nu(mpm_model, E_inp, nu_inp, device=device)
@@ -152,13 +155,15 @@ class MPMDifferentiableSimulationTrail(autograd.Function):
         ctx.num_particles = num_particles
 
         ctx.next_state_list = next_state_list
+        ctx.has_static_pos = static_pos is not None
 
         ctx.save_for_backward(density_change_mask)
 
-        # Convert all step positions to torch tensors, stacked [T, N, 3]
+        # Return frame endpoints and retain the matching states for the adjoint.
+        ctx.output_states = next_state_list[substep - 1::substep]
         all_positions = torch.stack([
             wp.to_torch(state.particle_x).detach().clone()
-            for state in next_state_list[::substep]], dim=0)
+            for state in ctx.output_states], dim=0)
 
         return all_positions  # shape: [num_substeps, num_particles, 3]
     
@@ -172,71 +177,36 @@ class MPMDifferentiableSimulationTrail(autograd.Function):
         last_state = ctx.next_state_list[-1]
         density_change_mask = ctx.saved_tensors[0]
 
-        # Reduce gradients over time dimension, e.g., sum or mean
-        out_pos_grad = out_pos_grad.sum(dim=0)  # shape: [num_particles, 3]
+        # Each output cotangent belongs to its own simulation time. Seeding
+        # arrays directly also avoids cancellation in a synthetic squared loss.
+        tape.backward(grads={
+            state.particle_x: from_torch_safe(grad.contiguous(), dtype=wp.vec3, requires_grad=False)
+            for state, grad in zip(ctx.output_states, out_pos_grad)
+        })
 
-        grad_pos_wp = from_torch_safe(out_pos_grad, dtype=wp.vec3, requires_grad=False)
-        target_pos_detach = wp.clone(last_state.particle_x, device=device, requires_grad=False)
-
-        with tape:
-            loss_wp = torch.zeros(1, device=device)
-            loss_wp = wp.from_torch(loss_wp, requires_grad=True)
-            wp.launch(
-                compute_posloss_with_grad, 
-                dim=num_particles,
-                inputs=[
-                    last_state,
-                    target_pos_detach,
-                    grad_pos_wp,
-                    0.5,
-                    loss_wp,
-                ],
-                device=device,
-            )
-
-        tape.backward(loss_wp)
-
-        pos_grad = None
+        pos_grad = (None if ctx.has_static_pos else
+                    wp.to_torch(mpm_state.particle_x.grad).detach().clone())
         if mpm_state.particle_v.grad is None:
             velo_grad = None
         else:
             velo_grad = wp.to_torch(mpm_state.particle_v.grad).detach().clone()
 
 
-        # grad for E, nu. TODO: add spatially varying E, nu later
+        E_grad = wp.to_torch(mpm_model.E.grad).detach().clone()
         if ctx.aggregating_E:
-            E_grad = wp.from_torch(torch.zeros(1, device=device), requires_grad=False)
-            wp.launch(
-                aggregate_grad,
-                dim=num_particles,
-                inputs=[
-                    E_grad,
-                    mpm_model.E.grad,
-                ],
-                device=device,
-            )
-            E_grad = wp.to_torch(E_grad)[0] / num_particles
-        else:
-            E_grad = wp.to_torch(mpm_model.E.grad).detach().clone()
+            E_grad = E_grad.sum().reshape(ctx.E_shape) * ctx.E_scale
 
+        nu_grad = wp.to_torch(mpm_model.nu.grad).detach().clone()
         if ctx.aggregating_nu:
-            nu_grad = wp.from_torch(torch.zeros(1, device=device), requires_grad=False)
-            wp.launch(
-                aggregate_grad,
-                dim=num_particles,
-                inputs=[nu_grad, mpm_model.nu.grad],
-                device=device,
-            )
-            nu_grad = wp.to_torch(nu_grad)[0] / num_particles   
-        else:
-            nu_grad = wp.to_torch(mpm_model.nu.grad).detach().clone()
+            nu_grad = nu_grad.sum().reshape(ctx.nu_shape)
 
         # grad for density
         if mpm_state.particle_density.grad is None:
             density_grad = None
         else:
-            density_grad = wp.to_torch(mpm_state.particle_density.grad).detach()
-            density_grad = density_grad[density_change_mask.type(torch.bool)]
+            density_grad = wp.to_torch(mpm_state.particle_density.grad).detach().clone()
+            if density_change_mask is not None:
+                density_grad *= density_change_mask.to(dtype=density_grad.dtype)
         
         density_mask_grad = None
         static_pos_grad = None 
@@ -300,17 +270,20 @@ class MPMDifferentiableSimulation(autograd.Function):
             init_xyzs_wp = from_torch_safe(init_pos.clone().detach().contiguous(), dtype=wp.vec3, requires_grad=requires_grad)
             mpm_solver.restart_and_compute_F_C(mpm_model, mpm_state, init_xyzs_wp, device=device)
         
-        if E.ndim == 0:
-            E_inp = E.item() # float
+        ctx.E_shape = E.shape
+        ctx.E_scale = 1.0
+        if E.numel() == 1:
+            E_inp = E.item()
             ctx.aggregating_E = True
         else:
-            E_inp = from_torch_safe(E, dtype=wp.float32, requires_grad=requires_grad)
+            E_inp = from_torch_safe(E.detach().contiguous(), dtype=wp.float32, requires_grad=False)
             ctx.aggregating_E = False
-        if nu.ndim == 0:
+        ctx.nu_shape = nu.shape
+        if nu.numel() == 1:
             nu_inp = nu.item() # float
             ctx.aggregating_nu = True
         else:
-            nu_inp = from_torch_safe(nu, dtype=wp.float32, requires_grad=requires_grad)
+            nu_inp = from_torch_safe(nu.detach().contiguous(), dtype=wp.float32, requires_grad=False)
             ctx.aggregating_nu = False
             
         mpm_solver.set_E_nu(mpm_model, E_inp, nu_inp, device=device)
@@ -363,6 +336,8 @@ class MPMDifferentiableSimulation(autograd.Function):
             mpm_solver.prepare_mu_lam(mpm_model, prev_state, device=device)
 
             for substep_local in range(num_substeps):
+                if mpm_solver.step_callback is not None:
+                    mpm_solver.step_callback(substep_local)
                 next_state = prev_state.partial_clone(requires_grad=requires_grad)
                 mpm_solver.p2g2p_differentiable(mpm_model, prev_state, next_state, substep_size, device=device)
 
@@ -378,6 +353,7 @@ class MPMDifferentiableSimulation(autograd.Function):
         ctx.num_particles = num_particles
 
         ctx.next_state_list = next_state_list
+        ctx.has_static_pos = static_pos is not None
 
         ctx.save_for_backward(density_change_mask)
 
@@ -396,68 +372,33 @@ class MPMDifferentiableSimulation(autograd.Function):
         last_state = ctx.next_state_list[-1]
         density_change_mask = ctx.saved_tensors[0]
 
-        grad_pos_wp = from_torch_safe(out_pos_grad, dtype=wp.vec3, requires_grad=False)
-        target_pos_detach = wp.clone(last_state.particle_x, device=device, requires_grad=False)
+        tape.backward(grads={
+            last_state.particle_x: from_torch_safe(out_pos_grad.contiguous(), dtype=wp.vec3, requires_grad=False)
+        })
 
-        with tape:
-            loss_wp = torch.zeros(1, device=device)
-            loss_wp = wp.from_torch(loss_wp, requires_grad=True)
-            wp.launch(
-                compute_posloss_with_grad, 
-                dim=num_particles,
-                inputs=[
-                    last_state,
-                    target_pos_detach,
-                    grad_pos_wp,
-                    0.5,
-                    loss_wp,
-                ],
-                device=device,
-            )
-
-        tape.backward(loss_wp)
-
-        pos_grad = None
+        pos_grad = (None if ctx.has_static_pos else
+                    wp.to_torch(mpm_state.particle_x.grad).detach().clone())
         if mpm_state.particle_v.grad is None:
             velo_grad = None
         else:
             velo_grad = wp.to_torch(mpm_state.particle_v.grad).detach().clone()
 
 
-        # grad for E, nu. TODO: add spatially varying E, nu later
+        E_grad = wp.to_torch(mpm_model.E.grad).detach().clone()
         if ctx.aggregating_E:
-            E_grad = wp.from_torch(torch.zeros(1, device=device), requires_grad=False)
-            wp.launch(
-                aggregate_grad,
-                dim=num_particles,
-                inputs=[
-                    E_grad,
-                    mpm_model.E.grad,
-                ],
-                device=device,
-            )
-            E_grad = wp.to_torch(E_grad)[0] / num_particles
-        else:
-            E_grad = wp.to_torch(mpm_model.E.grad).detach().clone()
+            E_grad = E_grad.sum().reshape(ctx.E_shape) * ctx.E_scale
 
+        nu_grad = wp.to_torch(mpm_model.nu.grad).detach().clone()
         if ctx.aggregating_nu:
-            nu_grad = wp.from_torch(torch.zeros(1, device=device), requires_grad=False)
-            wp.launch(
-                aggregate_grad,
-                dim=num_particles,
-                inputs=[nu_grad, mpm_model.nu.grad],
-                device=device,
-            )
-            nu_grad = wp.to_torch(nu_grad)[0] / num_particles   
-        else:
-            nu_grad = wp.to_torch(mpm_model.nu.grad).detach().clone()
+            nu_grad = nu_grad.sum().reshape(ctx.nu_shape)
 
         # grad for density
         if mpm_state.particle_density.grad is None:
             density_grad = None
         else:
-            density_grad = wp.to_torch(mpm_state.particle_density.grad).detach()
-            density_grad = density_grad[density_change_mask.type(torch.bool)]
+            density_grad = wp.to_torch(mpm_state.particle_density.grad).detach().clone()
+            if density_change_mask is not None:
+                density_grad *= density_change_mask.to(dtype=density_grad.dtype)
         
         density_mask_grad = None
         static_pos_grad = None 
