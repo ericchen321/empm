@@ -500,7 +500,7 @@ class MPMWARPDiff(object):
                 n = wp.vec3(param.normal[0], param.normal[1], param.normal[2])
                 dotproduct = wp.dot(offset, n)
 
-                if dotproduct < 0.0:
+                if dotproduct <= 0.0:
                     if param.surface_type == 0:
                         v_out = wp.vec3(
                             0.0, 0.0, 0.0
