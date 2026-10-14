@@ -164,7 +164,8 @@ class MPMWARPDiff(object):
         )
 
     def p2g2p_differentiable(
-        self, mpm_model, mpm_state, next_state, dt, device="cuda:0"
+        self, mpm_model, mpm_state, next_state, dt, device="cuda:0",
+        grid_boundary=None, step_index=0,
     ):
         """
         Some boundary conditions, might not give gradient,
@@ -284,6 +285,9 @@ class MPMWARPDiff(object):
                 mpm_state.grid_v_out = grid_v_out
                 if self.modify_bc[k] is not None:
                     self.modify_bc[k](self.time, dt, self.collider_params[k])
+
+        if grid_boundary is not None:
+            grid_boundary.apply(mpm_state, mpm_model, dt, step_index)
 
         # g2p
         with wp.ScopedTimer(
@@ -535,9 +539,7 @@ class MPMWARPDiff(object):
                             ) * wp.normalize(
                                 v
                             )  # apply friction here
-                        v_out = wp.vec3(
-                            0.0, 0.0, 0.0
-                        )
+                        v_out = v
             grid_v_out[grid_x, grid_y, grid_z] = v_out
 
         self.grid_postprocess.append(collide)

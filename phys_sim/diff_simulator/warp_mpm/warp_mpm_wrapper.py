@@ -98,7 +98,10 @@ class WarpMPMWrapper:
                  requires_grad=False,
                  frame_callback=None,
                  step_callback=None,
-                 optim_callback=None):
+                 optim_callback=None,
+                 particle_boundary=None,
+                 grid_boundary=None,
+                 frame_state_observer=None):
         self.n_particles = 0
         self.grid_size = grid_size
         self.grid_lim = grid_lim
@@ -120,6 +123,9 @@ class WarpMPMWrapper:
         self.frame_callback = frame_callback  # per-frame callback
         self.step_callback = step_callback  # per-step callback
         self.optim_callback = optim_callback  # per-optimization callback
+        self.particle_boundary = particle_boundary
+        self.grid_boundary = grid_boundary
+        self.frame_state_observer = frame_state_observer
 
         self.x_t = torch.empty((0, 3), dtype=DTYPE, device=self.device)
         self.v_t = torch.empty((0, 3), dtype=DTYPE, device=self.device)
@@ -281,6 +287,8 @@ class WarpMPMWrapper:
         """
         n_substeps = round(self.frame_dt / self.sim_dt)
         prev_state = self.mpm_state
+        if self.frame_state_observer is not None:
+            self.frame_state_observer(prev_state, 0)
         vertices = [wp.to_torch(prev_state.particle_x)]
         step_count = 0
         for frame in range(n_frames):
@@ -289,6 +297,8 @@ class WarpMPMWrapper:
             for substep in range(n_substeps):
                 if self.step_callback:
                     self.step_callback(self, step_count)
+                if self.particle_boundary is not None:
+                    self.particle_boundary.before_substep(prev_state, frame, substep)
                 next_state = prev_state.partial_clone(requires_grad=False)
                 self.mpm_solver.p2g2p_differentiable(
                     self.mpm_model,
@@ -296,9 +306,20 @@ class WarpMPMWrapper:
                     next_state,
                     self.sim_dt,
                     device=self.device,
+                    grid_boundary=self.grid_boundary,
+                    step_index=step_count,
                 )
+                if self.particle_boundary is not None:
+                    self.particle_boundary.after_substep(next_state, frame, substep)
                 prev_state = next_state
                 step_count += 1
+            if self.grid_boundary is not None and self.grid_boundary.finish_frame():
+                print(f"WARNING: grid boundary numerical failure at substep "
+                      f"{self.grid_boundary.failure_tick()}, discarding frame {frame + 1}",
+                      flush=True)
+                break
+            if self.frame_state_observer is not None:
+                self.frame_state_observer(prev_state, frame + 1)
             vertices.append(wp.to_torch(prev_state.particle_x))
 
         self.mpm_state = prev_state

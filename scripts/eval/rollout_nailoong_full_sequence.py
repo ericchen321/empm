@@ -28,6 +28,13 @@ from phys_sim.utils import cfg
 from scripts.train_test.run_nailoong_material_init import (
     PART_NAMES, configure_controllers, make_mpm,
 )
+from scripts.eval.nailoong_recorded_finger_patches import (
+    RecordedFingerMaterialPatches, prepare_recorded_finger_patches,
+)
+from scripts.eval.nailoong_recorded_finger_grid_centroids import RecordedFingerGridCentroids
+from scripts.eval.nailoong_material_face_observations import (
+    prepare_material_faces, reconstruct_material_faces,
+)
 from scripts.utils import set_all_seeds
 
 
@@ -65,8 +72,18 @@ def parse_args():
                         help="Inclusive final source state (default: last available)")
     parser.add_argument("--representation", choices=("legacy_surface", "matched_surface",
                                                    "tet_volume"), default="legacy_surface")
+    parser.add_argument("--floor-surface", choices=("sticky", "frictional"), default=None,
+                        help="Override the recorded floor surface for corrected representations")
+    parser.add_argument("--floor-friction", type=float, default=None,
+                        help="Override the recorded floor friction for corrected representations")
     parser.add_argument("--source-run", type=Path, default=Path(
         "/home/eric/research/HAG4R-Control/outputs/nailoong_dual_arm/run_v6"))
+    parser.add_argument("--controller-mode", choices=("grid_cubes", "recorded_finger_patches",
+                                                      "recorded_finger_grid_centroids"),
+                        default=None)
+    parser.add_argument("--observation-readout", choices=("grid_markers", "material_faces"),
+                        default=None)
+    parser.add_argument("--observation-field", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -137,7 +154,8 @@ def tet_geometry(source_run, start_source_step, observations_world, observation_
 
 
 def fixed_rollout(trainer, E_pa, initial_velocity_world, args, frame_count,
-                  start_source_step, geometry, observation_labels):
+                  start_source_step, geometry, observation_labels,
+                  recorded_controller_inputs=None, material_face_inputs=None):
     # Preserve the exact mapped source observations and instantaneous velocity.
     initial_x = transform_points(trainer.object_points[0].clone(), name=trainer.exp_name)
     initial_x -= torch.as_tensor(trainer.mpm_shift, dtype=initial_x.dtype,
@@ -180,11 +198,13 @@ def fixed_rollout(trainer, E_pa, initial_velocity_world, args, frame_count,
         mpm.material_params = {"material": "jelly"}
         mpm.add_particles(initial_x, initial_v, volumes, E_full, 0.3, 2000.0)
         mpm.surface_colliders.append(
-            [(0., 0., 0.5 - trainer.mpm_shift[2]), (0., 0., 1.), "sticky", 0.])
-        for i in range(trainer.n_ctrl_parts):
-            point = np.asarray(trainer.ctrl_param["handler_pos"][i]) - trainer.mpm_shift
-            mpm.moving_boundaries.append(
-                [point, trainer.ctrl_param["csize"][i], (0., 0., 0.), 0.0])
+            [(0., 0., 0.5 - trainer.mpm_shift[2]), (0., 0., 1.),
+             args.floor_surface, args.floor_friction])
+        if args.controller_mode == "grid_cubes":
+            for i in range(trainer.n_ctrl_parts):
+                point = np.asarray(trainer.ctrl_param["handler_pos"][i]) - trainer.mpm_shift
+                mpm.moving_boundaries.append(
+                    [point, trainer.ctrl_param["csize"][i], (0., 0., 0.), 0.0])
         mpm.initialize()
         mpm.mpm_model.grid_v_damping_scale = args.grid_damping
         mpm.mpm_solver.time = 0.0
@@ -203,12 +223,76 @@ def fixed_rollout(trainer, E_pa, initial_velocity_world, args, frame_count,
         "initial_full_particle_part_labels": particle_labels,
         "initial_full_particle_E_pa": mpm.E_t.cpu().numpy(),
     }
-    attach_timed_controllers(mpm, trainer, start_source_step)
+    readout_mode = getattr(args, "observation_readout", "grid_markers")
+    owner_F_frames = None
+    owner_initial_world_m = None
+    if readout_mode == "material_faces":
+        owner_full_ids = material_face_inputs["material_face_unique_owner_full_ids"]
+        owner_initial_world_m = initial_world[owner_full_ids].copy()
+        owner_indices = torch.as_tensor(owner_full_ids, dtype=torch.long, device=mpm.x_t.device)
+        owner_F_frames = []
+
+        def observe_frame(state, frame_index):
+            owner_F = wp.to_torch(state.particle_F_trial)[owner_indices]
+            owner_F_frames.append(owner_F.to(dtype=torch.float32).cpu().numpy().copy())
+
+        mpm.frame_state_observer = observe_frame
+    if args.controller_mode == "grid_cubes":
+        attach_timed_controllers(mpm, trainer, start_source_step)
+    elif args.controller_mode == "recorded_finger_patches":
+        mpm.particle_boundary = RecordedFingerMaterialPatches(recorded_controller_inputs)
+    elif args.controller_mode == "recorded_finger_grid_centroids":
+        mpm.grid_boundary = RecordedFingerGridCentroids(
+            recorded_controller_inputs, mpm.mpm_state, mpm.mpm_model,
+            mpm.mpm_solver.collider_params[0].point)
     sim_positions = mpm.advance_to(frame_count - 1)
     shifted = sim_positions + torch.as_tensor(trainer.mpm_shift,
                                               dtype=sim_positions.dtype,
                                               device=sim_positions.device)
-    return inv_transform_points(shifted, name=trainer.exp_name).cpu().numpy(), initialized
+    full_prediction = inv_transform_points(shifted, name=trainer.exp_name).cpu().numpy()
+    readout_summary = {"mode": readout_mode, "status": "ok",
+                       "completed_source_range": [start_source_step,
+                                                  start_source_step + len(full_prediction) - 1]}
+    if readout_mode == "material_faces":
+        owner_F_trial = np.stack(owner_F_frames)
+        owner_world_m = full_prediction[:, owner_full_ids]
+        selected_prediction = reconstruct_material_faces(
+            material_face_inputs, owner_initial_world_m, owner_world_m, owner_F_trial)
+        if isinstance(selected_prediction, dict):
+            failure = selected_prediction
+            selected_prediction = None
+            readout_summary.update(failure)
+            readout_summary["status"] = "numerical_failure"
+            readout_summary["first_failed_source_frame"] = (
+                start_source_step + failure["first_failed_frame"])
+            print(f"WARNING: material-face observation readout failed at source frame "
+                  f"{readout_summary['first_failed_source_frame']}: "
+                  f"{failure['component']}: {failure['reason']}",
+                  flush=True)
+        initialized["observation_readout_result"] = {
+            "prediction_world_m": selected_prediction,
+            "owner_F_trial": owner_F_trial,
+            "owner_initial_world_m": owner_initial_world_m,
+            "summary": readout_summary,
+        }
+    else:
+        initialized["observation_readout_result"] = {
+            "prediction_world_m": full_prediction[:, :len(observation_labels)],
+            "summary": readout_summary,
+        }
+    if args.controller_mode == "recorded_finger_patches":
+        initialized["controller_diagnostics"] = mpm.particle_boundary.diagnostics(full_prediction)
+    elif args.controller_mode == "recorded_finger_grid_centroids":
+        diagnostics = mpm.grid_boundary.diagnostics(full_prediction)
+        diagnostics["summary"].update({
+            "grid_collider_count": len(mpm.mpm_solver.collider_params),
+            "grid_cuboid_count": len(mpm.moving_boundaries),
+            "particle_velocity_modifier_count": len(mpm.mpm_solver.particle_velocity_modifiers),
+            "pre_p2g_operation_count": len(mpm.mpm_solver.pre_p2g_operations),
+            "particle_boundary_present": mpm.particle_boundary is not None,
+        })
+        initialized["controller_diagnostics"] = diagnostics
+    return full_prediction, initialized
 
 
 def body_height_mm(points, body_mask):
@@ -249,6 +333,36 @@ def main():
     args.case_dir = Path(args.case_dir)
     args.grid_damping = fit_summary["grid_velocity_damping"]
     args.representation = cli.representation
+    args.observation_readout = (cli.observation_readout or
+                                fit_summary["config"].get("observation_readout", "grid_markers"))
+    args.observation_field = (cli.observation_field or Path(
+        fit_summary["config"].get("observation_field",
+                                  "outputs/nailoong_material_init/field.npz")))
+    if (args.observation_readout == "material_faces" and
+            (args.representation != "tet_volume" or cli.start_source_step != 0)):
+        print("Unsupported material_faces readout: requires tet_volume initialized at "
+              "source state 0", flush=True)
+        return
+    args.controller_mode = (cli.controller_mode or
+                            fit_summary["config"].get("controller_mode", "grid_cubes"))
+    if args.controller_mode == "grid_cubes":
+        # Recorded-patch fits omit cube settings; an explicit cube override uses H1 defaults.
+        args.controller_halfsize = fit_summary["config"].get("controller_halfsize", .003)
+        args.controller_anchor = fit_summary["config"].get("controller_anchor", "semantic")
+        args.controller_vscale = fit_summary["config"].get("controller_vscale", None)
+    if args.controller_mode in ("recorded_finger_patches", "recorded_finger_grid_centroids") and (
+            args.representation != "tet_volume" or cli.start_source_step > 39):
+        raise ValueError("recorded finger modes require tet_volume and a start at or before source state 39")
+    args.floor_surface = (cli.floor_surface if cli.floor_surface is not None else
+                          fit_summary["config"].get("floor_surface", "sticky"))
+    args.floor_friction = (cli.floor_friction if cli.floor_friction is not None else
+                           fit_summary["config"].get("floor_friction", 0.0))
+    if args.representation == "legacy_surface" and (args.floor_surface != "sticky" or
+                                                     args.floor_friction != 0.0):
+        print("WARNING: corrected floor settings do not apply to legacy_surface; "
+              "using sticky/0", flush=True)
+        args.floor_surface = "sticky"
+        args.floor_friction = 0.0
     with np.load(cli.source_tracks) as archive:
         source = {key: archive[key] for key in archive.files}
     start_index = int(np.flatnonzero(source["source_steps"] == cli.start_source_step)[0])
@@ -256,7 +370,7 @@ def main():
                  int(np.flatnonzero(source["source_steps"] == cli.end_source_step)[0]))
     for key in ("object_points_world_m", "object_velocities_world_mps",
                 "controller_points_world_m", "object_visibilities", "source_steps",
-                "time_s"):
+                "time_s", "rigid_poses"):
         source[key] = source[key][start_index:end_index + 1]
     frame_count = len(source["source_steps"])
     assert np.isclose(float(source["fps"]), 1.0 / args.frame_dt)
@@ -267,6 +381,9 @@ def main():
     velocity = source["object_velocities_world_mps"].astype(np.float32)[0]
     geometry = (tet_geometry(cli.source_run, cli.start_source_step, target[0], labels)
                 if cli.representation != "legacy_surface" else None)
+    material_face_inputs = (prepare_material_faces(
+        cli.source_run, args.observation_field, target[0], labels)
+        if args.observation_readout == "material_faces" else None)
 
     cfg.load_from_yaml("configs/mpm_config.yaml")
     cfg.case_name = args.case_dir.name
@@ -280,7 +397,14 @@ def main():
                     "sim_dt": fit_summary["actual_sim_dt"]},
         mpm_shift=args.sim_shift,
     )
-    configure_controllers(trainer, labels, args)
+    recorded_controller_inputs = None
+    if args.controller_mode == "grid_cubes":
+        configure_controllers(trainer, labels, args)
+    else:
+        recorded_controller_inputs = prepare_recorded_finger_patches(
+            cli.source_run, source["source_steps"], source["rigid_poses"],
+            len(labels), args.sim_shift, args.frame_dt, fit_summary["actual_sim_dt"],
+            cfg.device)
     moduli = np.load(cli.run_dir / "moduli.npz")
     trajectories = {"gt_world_m": target,
                     "controller_world_m": source["controller_points_world_m"],
@@ -288,6 +412,19 @@ def main():
                     "source_steps": source["source_steps"],
                     "time_s": source["time_s"],
                     "object_visibilities": visible}
+    if material_face_inputs is not None:
+        trajectories.update(material_face_inputs)
+    if recorded_controller_inputs is not None:
+        prepared = recorded_controller_inputs
+        trajectories.update({
+            "controller_patch_ids": prepared["patch_ids"],
+            "controller_tet_ids": prepared["tet_ids"],
+            "controller_full_ids": prepared["full_ids"],
+            "controller_patch_links": prepared["links"],
+            "controller_patch_part_labels": prepared["part_labels"],
+            "controller_patch_activation_source_steps": prepared["activation_steps"],
+            "controller_rigid_poses_xyz_wxyz": prepared["poses_xyz_wxyz"],
+        })
     rows = []
     per_frame = []
     result = {
@@ -297,6 +434,19 @@ def main():
         "source_selected_state": str(cli.source_run / "states" /
                                      f"{cli.start_source_step:06d}.npz"),
         "representation": cli.representation,
+        "observation_readout": args.observation_readout,
+        "observation_field": str(args.observation_field),
+        "observation_prediction": ("material-attached source0 face reconstruction from "
+            "actual initialized owner centers and completed endpoint F_trial, followed "
+            "by proper triangle Kabsch transfer" if material_face_inputs is not None else
+            "independently advected grid markers"),
+        "legacy_grid_markers": "retained as unchanged independently advected diagnostics",
+        "observation_correspondence": ("fixed privileged synthetic source face associations "
+            "shared by both fit arms; no future object targets used for readout"),
+        "inference": "forward numerical inference; full source0--149 includes training frames",
+        "holdout_disclosure": ("source135--149 did not select fitted parameters but was "
+                               "previously inspected during model debugging"),
+        "material_prior_disclosure": "source material asset supplied the semantic prior",
         "particle_count": len(labels), "frame_count": frame_count,
         "source_steps": [int(source["source_steps"][0]), int(source["source_steps"][-1])],
         "initial_time_s": float(source["time_s"][0]),
@@ -305,8 +455,9 @@ def main():
         "mpm_substep_dt_s": fit_summary["actual_sim_dt"],
         "grid_velocity_damping_per_substep": args.grid_damping,
         "grid_size": args.grid_size, "grid_lim_sim_units": args.grid_lim,
-        "sim_shift": args.sim_shift, "controller_halfsize_sim_units":
-            args.controller_halfsize,
+        "sim_shift": args.sim_shift, "controller_mode": args.controller_mode,
+        "grid_cuboid_count": 2 if args.controller_mode == "grid_cubes" else 0,
+        "grid_collider_count": 3 if args.controller_mode == "grid_cubes" else 1,
         "density_parameter": 2000.0, "poisson_ratio": 0.3,
         "material_law": "jelly", "initial_deformation_gradient": "identity",
         "initial_affine_velocity": "zero",
@@ -318,19 +469,48 @@ def main():
         "mass_units": "density parameter times simulator volume; not physical kg",
         "initial_state": (f"mapped FEM source state {cli.start_source_step} positions "
                           "and instantaneous velocities, no floor lift"),
-        "floor": "existing sticky plane at world z=0",
+        "floor": (f"{args.floor_surface} plane at world z=0, "
+                  f"friction {args.floor_friction:g}"),
+        "floor_surface": args.floor_surface,
+        "floor_friction": args.floor_friction,
         "floor_sim_z": 0.5 - trainer.mpm_shift[2],
-        "controller_activation": {
-            "belly": "transition source state 39 to 40",
-            "ring": "transition source state 40 to 41"},
-        "controller_anchors": ("nearest same-part particle at initial source state; "
-                               "follows gripper centers"),
-        "controller_initial_anchor_sim_unshifted": [np.asarray(p).tolist()
-                                                      for p in trainer.ctrl_param["handler_pos"]],
-        "controller_velocity_scales": trainer.ctrl_param["vscale"],
         "material_fields": "unchanged fitted checkpoint fields; no optimization",
         "results": {},
     }
+    if recorded_controller_inputs is None:
+        result.update({
+            "controller_halfsize_sim_units": args.controller_halfsize,
+            "controller_activation": {
+                "belly": "transition source state 39 to 40",
+                "ring": "transition source state 40 to 41"},
+            "controller_anchors": ("nearest same-part particle at initial source state; "
+                                   "follows gripper centers"),
+            "controller_initial_anchor_sim_unshifted": [np.asarray(p).tolist()
+                                                          for p in trainer.ctrl_param["handler_pos"]],
+            "controller_velocity_scales": trainer.ctrl_param["vscale"],
+        })
+    else:
+        result.update({
+            "source_snap_bindings": str(cli.source_run / "snap_bindings.json"),
+            "controller_pose_source": f"{cli.source_tracks}:rigid_poses",
+            "controller_pose_convention": "world xyz+wxyz; wxyz reordered to xyzw for SciPy",
+            "controller_interpolation": "linear translation and shortest-arc SciPy Slerp at integer substep ticks",
+            "controller_patch_definitions": recorded_controller_inputs["patches"],
+            "controller_offset_units": "world metres; simulated offsets divide by 5",
+            "controller_approximation": ("kinematic hard attachment to four source finger links; "
+                                         "source snaps had finite stiffness and native contact"),
+            "controller_contact_association": ("privileged synthetic source binding metadata "
+                                               "for 13 vertex/link associations, shared by both "
+                                               "potential fit arms; no future object targets"),
+        })
+        if args.controller_mode == "recorded_finger_grid_centroids":
+            result["controller_approximation"] = (
+                "mass-weighted patch-centroid grid projection, actual capture from simulated "
+                "states 39/40; hard centroids approximate finite source snaps and native contact")
+            result["controller_grid_projection"] = (
+                "joint exact float64 solve with diagonal equilibration after frictional floor; "
+                "correction only above floor at grid mass >1e-15; no particle writes; "
+                "ordinary marker advection; forward-only optimization")
     for evaluation in cli.evaluations:
         for arm in cli.arms:
             key = f"{arm}_eval{evaluation}"
@@ -339,12 +519,25 @@ def main():
             set_all_seeds(args.seed)
             full_prediction, initialized = fixed_rollout(
                 trainer, E_pa, velocity, args, frame_count, cli.start_source_step,
-                geometry, labels)
-            prediction = full_prediction[:, :len(labels)]
+                geometry, labels, recorded_controller_inputs, material_face_inputs)
+            diagnostics = initialized.pop("controller_diagnostics", None)
+            readout = initialized.pop("observation_readout_result")
+            if diagnostics is not None:
+                for diagnostic_name, values in diagnostics.items():
+                    if diagnostic_name != "summary":
+                        trajectories[f"{key}_controller_{diagnostic_name}"] = values
+            prediction = readout["prediction_world_m"]
             material_mask = initialized["initial_full_particle_volumes_sim"] > 0
             material_labels = initialized["initial_full_particle_part_labels"][material_mask]
-            trajectories[f"{key}_world_m"] = prediction
+            if prediction is not None:
+                trajectories[f"{key}_world_m"] = prediction
+            trajectories[f"{key}_grid_marker_world_m"] = full_prediction[:, :len(labels)]
             trajectories[f"{key}_material_world_m"] = full_prediction[:, material_mask]
+            trajectories[f"{key}_observation_readout_summary_json"] = np.array(
+                json.dumps(readout["summary"]))
+            if material_face_inputs is not None:
+                trajectories[f"{key}_owner_F_trial"] = readout["owner_F_trial"]
+                trajectories[f"{key}_owner_initial_world_m"] = readout["owner_initial_world_m"]
             trajectories[f"{key}_initial_full_particle_E_pa"] = initialized.pop(
                 "initial_full_particle_E_pa")
             if "initial_full_particle_world_m" not in trajectories:
@@ -367,6 +560,34 @@ def main():
                         "mass_rho_times_sim_volume": float(
                             2000.0 * volumes[particle_labels == label].sum()),
                     } for label, name in PART_NAMES.items()}
+            controller_failed = (diagnostics is not None and
+                                 diagnostics["summary"].get("status") == "numerical_failure")
+            readout_failed = readout["summary"]["status"] == "numerical_failure"
+            if controller_failed or readout_failed:
+                raw_range = [cli.start_source_step,
+                             cli.start_source_step + len(full_prediction) - 1]
+                result["results"][key] = {
+                    "status": "numerical_failure",
+                    "numerical_failure_component": ("grid_projection" if controller_failed
+                                                    else "observation_readout"),
+                    "raw_completed_source_range": raw_range,
+                    "completed_source_range": raw_range,
+                    "observation_readout": readout["summary"],
+                    "wall_time_s": time.perf_counter() - started,
+                }
+                if diagnostics is not None:
+                    result["results"][key]["controller_diagnostics"] = diagnostics["summary"]
+                result["status"] = "numerical_failure"
+                result["numerical_failure_component"] = result["results"][key][
+                    "numerical_failure_component"]
+                result["raw_completed_source_range"] = raw_range
+                result["completed_source_range"] = raw_range
+                np.savez_compressed(cli.output_dir / "trajectories.npz", **trajectories)
+                (cli.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
+                print(f"{key}: {result['numerical_failure_component']} numerical failure; "
+                      f"raw prefix ends at source state {raw_range[1]}",
+                      flush=True)
+                return
             arm_rows, distance_mm = metrics_for(key, prediction, target, visible,
                                                 labels, source["source_steps"])
             rows.extend(arm_rows)
@@ -391,7 +612,10 @@ def main():
                 "wall_time_s": time.perf_counter() - started,
                 "overall_rmse_mm": arm_rows[0]["rmse_mm"],
                 "final_frame_rmse_mm": per_frame[-1]["rmse_mm"],
+                "observation_readout": readout["summary"],
             }
+            if diagnostics is not None:
+                result["results"][key]["controller_diagnostics"] = diagnostics["summary"]
             np.savez_compressed(cli.output_dir / "trajectories.npz", **trajectories)
             (cli.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
             print(f"{key}: overall RMSE {arm_rows[0]['rmse_mm']:.3f} mm, "
