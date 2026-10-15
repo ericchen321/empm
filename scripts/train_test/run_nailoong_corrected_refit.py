@@ -56,6 +56,14 @@ def parse_args():
                         default="grid_markers")
     parser.add_argument("--observation-field", type=Path,
                         default=Path("outputs/nailoong_material_init/field.npz"))
+    parser.add_argument("--arms", nargs="+",
+                        choices=("default", "spatial", "homogeneous"),
+                        default=("default", "spatial"))
+    parser.add_argument("--vlm-scale", choices=("mean8000", "physical_similarity"),
+                        default="mean8000")
+    parser.add_argument("--substeps-per-frame", type=int, default=334)
+    parser.add_argument("--max-evaluations", type=int, default=MAX_EVALUATIONS)
+    parser.add_argument("--no-substep-profiling", action="store_true")
     return parser.parse_args()
 
 
@@ -91,12 +99,26 @@ def main():
     tet_labels, tet_volumes = geometry[2], geometry[3]
     body_volume_fraction = float(tet_volumes[tet_labels == 0].sum() /
                                  tet_volumes.sum())
-    semantic_body_E = 8000.0 / (body_volume_fraction +
-                                440.0 * (1.0 - body_volume_fraction))
+    with np.load(cli.observation_field) as archive:
+        assert np.array_equal(archive["part_labels"], labels)
+        source_body_E = float(archive["youngs_modulus_pa"][labels == 0][0])
+        source_hardware_E = float(archive["youngs_modulus_pa"][labels != 0][0])
+        source_density = float(archive["density_kg_m3"][0])
+    if cli.vlm_scale == "physical_similarity":
+        vlm_multiplier = (2000.0 / source_density) / 5.0 ** 2
+    else:
+        vlm_multiplier = 8000.0 / (body_volume_fraction * source_body_E +
+                                     (1.0 - body_volume_fraction) * source_hardware_E)
+    semantic_E = np.array([source_body_E, source_hardware_E]) * vlm_multiplier
+    homogeneous_E = float(body_volume_fraction * semantic_E[0] +
+                          (1.0 - body_volume_fraction) * semantic_E[1])
     seed_E = {
         "default": np.array([8000.0, 8000.0]),
-        "spatial": np.array([semantic_body_E, 440.0 * semantic_body_E]),
+        "spatial": semantic_E,
+        "homogeneous": np.array([homogeneous_E, homogeneous_E]),
     }
+    sim_dt = (1.0 / 30.0) / cli.substeps_per_frame
+    grid_damping = math.sqrt(.98) ** (sim_dt / SIM_DT)
 
     args = SimpleNamespace(
         case_dir=cli.case_dir, grid_size=32, grid_lim=.064,
@@ -105,8 +127,9 @@ def main():
         controller_vscale=None, start_frame=0, representation="tet_volume",
         controller_mode=cli.controller_mode,
         observation_readout=cli.observation_readout,
-        grid_damping=math.sqrt(.98), floor_surface="frictional",
+        grid_damping=grid_damping, floor_surface="frictional",
         floor_friction=0.9,
+        profile_substeps=not cli.no_substep_profiling,
     )
     cfg.load_from_yaml("configs/mpm_config.yaml")
     cfg.case_name = cli.case_dir.name
@@ -116,7 +139,7 @@ def main():
         data_path=str(case_path), base_dir=str(cli.output_dir),
         train_frame=TRAIN_FRAME_COUNT, save_artifacts=False,
         mpm_kwargs={"grid_size": args.grid_size, "grid_lim": args.grid_lim,
-                    "frame_dt": args.frame_dt, "sim_dt": SIM_DT},
+                    "frame_dt": args.frame_dt, "sim_dt": sim_dt},
         mpm_shift=args.sim_shift,
     )
     recorded_controller_inputs = None
@@ -125,7 +148,7 @@ def main():
     else:
         recorded_controller_inputs = prepare_recorded_finger_patches(
             cli.source_run, source["source_steps"], source["rigid_poses"],
-            len(labels), args.sim_shift, args.frame_dt, SIM_DT, cfg.device)
+            len(labels), args.sim_shift, args.frame_dt, sim_dt, cfg.device)
 
     summary = {
         "config": {
@@ -137,6 +160,7 @@ def main():
             "observation_field": str(cli.observation_field),
             "floor_surface": args.floor_surface,
             "floor_friction": args.floor_friction,
+            "profile_substeps": args.profile_substeps,
         },
         "source_tracks": str(cli.source_tracks),
         "source_run": str(cli.source_run),
@@ -156,7 +180,8 @@ def main():
                                "previously inspected during model debugging"),
         "material_prior_disclosure": "source material asset supplied the semantic prior",
         "representation": "tet_volume",
-        "actual_sim_dt": SIM_DT,
+        "actual_sim_dt": sim_dt,
+        "substeps_per_frame": cli.substeps_per_frame,
         "grid_velocity_damping": args.grid_damping,
         "source_step_ranges": {
             "initialization": [0, 0], "train": [1, 134],
@@ -165,15 +190,21 @@ def main():
         "observation_count": int(len(labels)),
         "material_tet_count": int(len(tet_labels)),
         "body_tet_volume_fraction": body_volume_fraction,
-        "semantic_prior_hardware_body_ratio": 440.0,
-        "semantic_seed_normalization": "source0 tet-volume arithmetic mean 8000 Pa",
-        "seed_E_pa": {arm: values.tolist() for arm, values in seed_E.items()},
+        "semantic_prior_hardware_body_ratio": source_hardware_E / source_body_E,
+        "semantic_seed_normalization": cli.vlm_scale,
+        "vlm_source_E_pa": [source_body_E, source_hardware_E],
+        "vlm_source_density_kg_m3": source_density,
+        "vlm_simulator_density_parameter": 2000.0,
+        "vlm_world_to_sim_length_divisor": 5.0,
+        "vlm_global_multiplier": vlm_multiplier,
+        "homogeneous_seed_definition": "source0 tet-volume weighted arithmetic mean of scaled VLM E",
+        "seed_E_pa": {arm: seed_E[arm].tolist() for arm in cli.arms},
         "method": "forward numerical optimization of corrected EMPM",
         "parameterization": "two free direct log-E values: body and all hardware, Pa",
         "loss": "pooled visible source states 1--134 squared Euclidean distance, world mm^2",
         "selection": "lowest finite evaluated training loss, including seed; no holdout or full replay selection",
         "optimizer": {
-            "method": "Nelder-Mead", "maxfev": MAX_EVALUATIONS,
+            "method": "Nelder-Mead", "maxfev": cli.max_evaluations,
             "initial_simplex_log_offsets": [[0.0, 0.0], [.5, 0.0], [0.0, .5]],
             "xatol": 1e-10, "fatol": 1e-10,
         },
@@ -211,8 +242,8 @@ def main():
     readout_failures = {}
     summary_path = cli.output_dir / "summary.json"
     save_summary(summary_path, summary)
-    fields = {f"{arm}_initial_pa": material_field(np.log(values), labels)
-              for arm, values in seed_E.items()}
+    fields = {f"{arm}_initial_pa": material_field(np.log(seed_E[arm]), labels)
+              for arm in cli.arms}
     np.savez_compressed(cli.output_dir / "moduli.npz", **fields)
 
     with (cli.output_dir / "history.csv").open("w", newline="") as stream:
@@ -220,7 +251,7 @@ def main():
         writer.writeheader()
         stream.flush()
 
-        for arm in ("default", "spatial"):
+        for arm in cli.arms:
             set_all_seeds(args.seed)
             arm_started = time.perf_counter()
             q0 = np.log(seed_E[arm])
@@ -351,7 +382,7 @@ def main():
 
             result = minimize(
                 objective, q0, method="Nelder-Mead",
-                options={"initial_simplex": simplex, "maxfev": MAX_EVALUATIONS,
+                options={"initial_simplex": simplex, "maxfev": cli.max_evaluations,
                          "xatol": 1e-10, "fatol": 1e-10},
             )
             if best_q is None:
@@ -366,7 +397,7 @@ def main():
                       flush=True)
                 return
             selected_E = np.exp(best_q)
-            fields[f"{arm}_eval{MAX_EVALUATIONS}_pa"] = material_field(best_q, labels)
+            fields[f"{arm}_eval{cli.max_evaluations}_pa"] = material_field(best_q, labels)
             np.savez_compressed(cli.output_dir / "moduli.npz", **fields)
             arm_wall_time = time.perf_counter() - arm_started
             summary["arms"][arm] = {
@@ -378,7 +409,7 @@ def main():
                 "selected_E_pa": selected_E.tolist(),
                 "selected_train_mse_mm2": best_loss,
                 "nfev": int(result.nfev),
-                "converged_before_maxfev": bool(result.nfev < MAX_EVALUATIONS),
+                "converged_before_maxfev": bool(result.nfev < cli.max_evaluations),
                 "optimizer_message": str(result.message),
                 "wall_time_s": arm_wall_time,
             }

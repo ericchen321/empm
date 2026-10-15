@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path,
                         default=Path("outputs/nailoong_full_sequence/rollout"))
     parser.add_argument("--evaluations", type=int, nargs="+", default=(8,))
-    parser.add_argument("--arms", nargs="+", choices=("default", "spatial"),
+    parser.add_argument("--arms", nargs="+", choices=("default", "spatial", "homogeneous"),
                         default=("default", "spatial"))
     parser.add_argument("--start-source-step", type=int, default=0,
                         help="Source state used to initialize the open-loop rollout")
@@ -206,6 +206,7 @@ def fixed_rollout(trainer, E_pa, initial_velocity_world, args, frame_count,
                 mpm.moving_boundaries.append(
                     [point, trainer.ctrl_param["csize"][i], (0., 0., 0.), 0.0])
         mpm.initialize()
+        mpm.mpm_solver.profile_substeps = getattr(args, "profile_substeps", True)
         mpm.mpm_model.grid_v_damping_scale = args.grid_damping
         mpm.mpm_solver.time = 0.0
 
@@ -514,7 +515,10 @@ def main():
     for evaluation in cli.evaluations:
         for arm in cli.arms:
             key = f"{arm}_eval{evaluation}"
-            E_pa = moduli[f"{key}_pa"]
+            field_key = f"{key}_pa"
+            if evaluation == 0 and field_key not in moduli.files:
+                field_key = f"{arm}_initial_pa"
+            E_pa = moduli[field_key]
             started = time.perf_counter()
             set_all_seeds(args.seed)
             full_prediction, initialized = fixed_rollout(

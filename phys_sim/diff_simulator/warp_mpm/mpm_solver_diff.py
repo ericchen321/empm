@@ -1,5 +1,6 @@
 import sys
 import os
+from contextlib import nullcontext
 
 import warp as wp
 
@@ -14,6 +15,12 @@ class MPMWARPDiff(object):
 
     def __init__(self):
         self.time_profile = {}
+        self.profile_substeps = True
+
+    def substep_timer(self, name):
+        if not self.profile_substeps:
+            return nullcontext()
+        return wp.ScopedTimer(name, synchronize=True, print=False, dict=self.time_profile)
 
     def initialize(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0"):
         self.n_particles = n_particles
@@ -213,12 +220,7 @@ class MPMWARPDiff(object):
         # F_trail => F                    # TODO: this is overite..
         # F, SVD(F), lam, mu => Stress.   # TODO: this is overite..
 
-        with wp.ScopedTimer(
-            "compute_stress_from_F_trial",
-            synchronize=True,
-            print=False,
-            dict=self.time_profile,
-        ):
+        with self.substep_timer("compute_stress_from_F_trial"):
             wp.launch(
                 kernel=compute_stress_from_F_trial,
                 dim=self.n_particles,
@@ -227,12 +229,7 @@ class MPMWARPDiff(object):
             )  # F and stress are updated
 
         # p2g
-        with wp.ScopedTimer(
-            "p2g",
-            synchronize=True,
-            print=False,
-            dict=self.time_profile,
-        ):
+        with self.substep_timer("p2g"):
             wp.launch(
                 kernel=p2g_apic_with_stress,
                 dim=self.n_particles,
@@ -241,9 +238,7 @@ class MPMWARPDiff(object):
             )  # apply p2g'
 
         # grid update
-        with wp.ScopedTimer(
-            "grid_update", synchronize=True, print=False, dict=self.time_profile
-        ):
+        with self.substep_timer("grid_update"):
             wp.launch(
                 kernel=grid_normalization_and_gravity,
                 dim=(grid_size),
@@ -260,9 +255,7 @@ class MPMWARPDiff(object):
             )
 
         # apply BC on grid, collide
-        with wp.ScopedTimer(
-            "apply_BC_on_grid", synchronize=True, print=False, dict=self.time_profile
-        ):
+        with self.substep_timer("apply_BC_on_grid"):
             for k in range(len(self.grid_postprocess)):
                 # A contact velocity replaces the incoming velocity. Keeping
                 # separate arrays prevents its cotangent leaking through the
@@ -290,9 +283,7 @@ class MPMWARPDiff(object):
             grid_boundary.apply(mpm_state, mpm_model, dt, step_index)
 
         # g2p
-        with wp.ScopedTimer(
-            "g2p", synchronize=True, print=False, dict=self.time_profile
-        ):
+        with self.substep_timer("g2p"):
             wp.launch(
                 kernel=g2p_differentiable,
                 dim=self.n_particles,
